@@ -27,18 +27,16 @@ export interface ToolMapping {
 //   read_file(path, offset?, limit?)
 //   write_file(path, content)
 //   patch(mode, path, old_string, new_string, replace_all?)
-//   search_files(pattern, path?, target?, file_glob?, limit?, output_mode?, context?)
-//   browser_navigate(url)
-//   delegate_task(goal, context?, tasks?, toolsets?)
+//   search_files(pattern, path?, target?, file_glob?, limit?, output_mode?, context?, offset?)
 //
 // Cursor SDK tool reference (from cursor-sdk.ts):
 //   shell  → { command, workingDirectory?, timeout? }
 //   read   → { path, offset?, limit?, includeLineNumbers? }
 //   write  → { path, fileText }
-//   edit   → { path, streamContent }  (normalizeSdkToolCallForOpenCode converts to write)
+//   edit   → { path, streamContent }  (full-file content, NOT a diff)
 //   delete → { path }
-//   glob   → { targetDirectory, globPattern }
-//   grep   → { pattern, path?, glob?, outputMode?, contextBefore?, contextAfter?, ... }
+//   glob   → { targetDirectory?, globPattern }
+//   grep   → { pattern, path?, glob?, outputMode?, contextBefore?, contextAfter?, context?, headLimit?, ... }
 //   ls     → { path, ignore? }
 //   mcp    → { name, args, providerIdentifier?, toolName? }
 //   readLints → { paths }
@@ -52,8 +50,9 @@ export const TOOL_MAPPINGS: ToolMapping[] = [
     argMap: {
       command: "command",
       workingDirectory: "workdir",
+      // timeout: name matches Hermes exactly, passes through as-is
     },
-    dropArgs: ["toolCallId", "timeout"],
+    dropArgs: ["toolCallId"],
     fallbackName: "cursor_shell",
   },
 
@@ -82,30 +81,29 @@ export const TOOL_MAPPINGS: ToolMapping[] = [
     fallbackName: "cursor_write",
   },
 
-  // ── edit → patch ───────────────────────────────────────────────
-  // Cursor edit: { path, streamContent }
-  // Hermes patch: { mode: "replace", path, old_string, new_string }
-  // For a full-file write, map edit → write_file (fileText=streamContent)
-  // For a diff edit, map edit → patch (best-effort, since Cursor's edit
-  //   format differs from Hermes patch)
+  // ── edit → write_file (primary) / patch (fallback) ────────────
+  // IMPORTANT: Cursor's edit tool provides streamContent = FULL file content,
+  //            not a diff. So we MUST prefer write_file over patch.
+  //            patch requires old_string + new_string (a diff), which
+  //            we cannot produce from streamContent alone.
   {
     cursorName: "edit",
-    callerNames: ["patch", "edit_file", "apply_edit", "replace_in_file", "edit"],
+    callerNames: ["write_file", "patch", "edit_file", "apply_edit", "replace_in_file", "edit"],
     argMap: {
       path: "path",
-      streamContent: "new_string",
+      streamContent: "content", // maps to write_file.content by default
     },
     dropArgs: ["toolCallId"],
     fallbackName: "cursor_edit",
   },
 
-  // ── delete ──────────────────────────────────────────────────────
-  // Hermes has no direct delete tool — map to terminal with `rm`
+  // ── delete → terminal (rm -rf) ────────────────────────────────
+  // Hermes has no direct delete tool — wrap in terminal
   {
     cursorName: "delete",
-    callerNames: ["terminal", "delete_file", "delete", "remove_file", "file_delete"],
+    callerNames: ["terminal", "shell", "bash", "run_command", "execute_command", "delete_file", "delete", "remove_file", "file_delete"],
     argMap: {
-      path: "command", // will be wrapped in rm -rf
+      // path → command is handled by special logic (rm -rf wrapping)
     },
     dropArgs: ["toolCallId"],
     fallbackName: "cursor_delete",
@@ -126,8 +124,8 @@ export const TOOL_MAPPINGS: ToolMapping[] = [
   },
 
   // ── grep → search_files ────────────────────────────────────────
-  // Cursor grep: { pattern, path?, glob?, outputMode?, ... }
-  // Hermes search_files(target="content"): { pattern, path?, file_glob?, output_mode? }
+  // Cursor grep: { pattern, path?, glob?, outputMode?, contextBefore?, contextAfter?, context?, headLimit?, offset? }
+  // Hermes search_files(target="content"): { pattern, path?, file_glob?, output_mode?, context?, limit?, offset? }
   {
     cursorName: "grep",
     callerNames: ["search_files", "grep", "search", "content_search", "file_search"],
@@ -136,11 +134,13 @@ export const TOOL_MAPPINGS: ToolMapping[] = [
       path: "path",
       glob: "file_glob",
       outputMode: "output_mode",
+      headLimit: "limit",
+      context: "context",
+      offset: "offset",
     },
     dropArgs: [
-      "toolCallId", "contextBefore", "contextAfter", "context",
-      "headLimit", "sortAscending", "multiline", "caseInsensitive",
-      "offset", "sort", "type",
+      "toolCallId", "contextBefore", "contextAfter",
+      "sortAscending", "multiline", "caseInsensitive", "sort", "type",
     ],
     fallbackName: "cursor_grep",
   },
@@ -175,6 +175,7 @@ export const TOOL_MAPPINGS: ToolMapping[] = [
   },
 
   // ── mcp ────────────────────────────────────────────────────────
+  // TODO: When Hermes adds MCP tool support, add callerNames here
   {
     cursorName: "mcp",
     callerNames: [],
@@ -183,6 +184,11 @@ export const TOOL_MAPPINGS: ToolMapping[] = [
     fallbackName: "cursor_mcp",
   },
 ];
+
+/** Shell-like tool names — used for delete → rm special handling */
+const SHELL_LIKE_NAMES = new Set([
+  "terminal", "shell", "bash", "run_command", "execute_command", "run",
+]);
 
 // ─── Types ────────────────────────────────────────────────────────
 
@@ -210,13 +216,16 @@ export interface MappedToolCall {
  * Map a Cursor SDK tool call to the caller's OpenAI tool_calls format.
  *
  * Strategy (priority order):
- *  1. Exact name match: if caller registered a tool with the exact same name → use it as-is
+ *  1. Exact name match → apply dropArgs + argMap from mapping table (if available)
  *  2. Mapping table: walk TOOL_MAPPINGS, find first callerNames match → transform args
  *  3. Fallback: prefix cursor_ + pass args as-is
  *
  * Special handling:
- *  - delete with caller=terminal → auto-wrap path in `rm -rf`
- *  - glob/grep with target=search_files → add target="files"/"content" implicitly
+ *  - delete with shell-like caller → auto-wrap path in `rm -rf`
+ *  - glob → search_files: add target="files"
+ *  - grep → search_files: add target="content", merge contextBefore/After → context
+ *  - ls → search_files: add target="files" + pattern="*"
+ *  - edit → patch: rewrite as write_file (since streamContent is full content, not diff)
  */
 export function mapToolCall(
   cursorToolName: string,
@@ -231,7 +240,12 @@ export function mapToolCall(
     (t) => t.function.name.toLowerCase() === normalizedCursor
   );
   if (exactMatch) {
-    return makeToolCall(callId, exactMatch.function.name, cursorArgs);
+    // Still apply dropArgs from the mapping table if available, to strip internal fields
+    const mapping = TOOL_MAPPINGS.find((m) => m.cursorName === normalizedCursor);
+    const cleanedArgs = mapping
+      ? transformArgs(cursorArgs, mapping.argMap, mapping.dropArgs)
+      : cursorArgs;
+    return makeToolCall(callId, exactMatch.function.name, cleanedArgs);
   }
 
   // 2) Walk mapping table
@@ -244,11 +258,14 @@ export function mapToolCall(
       if (found) {
         let mappedArgs = transformArgs(cursorArgs, mapping.argMap, mapping.dropArgs);
 
-        // ── Special: delete → terminal (wrap in rm) ──────────────
-        if (normalizedCursor === "delete" && found.function.name === "terminal") {
-          const targetPath = cursorArgs.path as string || "";
+        // ── Special: delete → shell-like tool (wrap in rm -rf) ───
+        if (normalizedCursor === "delete" && SHELL_LIKE_NAMES.has(found.function.name.toLowerCase())) {
+          const targetPath = (cursorArgs.path as string) || "";
           mappedArgs = { command: `rm -rf ${shellQuote(targetPath)}` };
         }
+
+        // ── Special: delete → non-shell caller (pass path through) ─
+        // (delete_file etc. accepts path directly, no wrapping needed)
 
         // ── Special: glob → search_files (set target=files) ──────
         if (normalizedCursor === "glob" && found.function.name === "search_files") {
@@ -258,36 +275,52 @@ export function mapToolCall(
         // ── Special: grep → search_files (set target=content) ────
         if (normalizedCursor === "grep" && found.function.name === "search_files") {
           mappedArgs.target = "content";
-        }
-
-        // ── Special: edit → patch (mode=replace) ─────────────────
-        if (normalizedCursor === "edit" && found.function.name === "patch") {
-          mappedArgs.mode = "replace";
-          // edit only has streamContent (full new content), no old_string
-          // so we can't do a proper old_string/new_string diff
-          // Instead, map to write_file if available; if not, set old_string=""
-          if (mappedArgs.new_string !== undefined && !mappedArgs.old_string) {
-            // For patch mode, we need old_string. Since Cursor edit
-            // doesn't provide it, fall through to write_file if possible
-            const writeFileTool = callerTools.find(
-              (t) => t.function.name.toLowerCase() === "write_file"
-            );
-            if (writeFileTool) {
-              return makeToolCall(callId, writeFileTool.function.name, {
-                path: cursorArgs.path,
-                content: cursorArgs.streamContent ?? cursorArgs.fileText ?? "",
-              });
+          // Merge contextBefore/contextAfter → context (if not already set)
+          if (mappedArgs.context === undefined) {
+            const before = Number(cursorArgs.contextBefore) || 0;
+            const after = Number(cursorArgs.contextAfter) || 0;
+            if (before || after) {
+              mappedArgs.context = Math.max(before, after);
             }
-            // Last resort: use patch with empty old_string (full replace)
-            mappedArgs.old_string = "";
           }
         }
 
-        // ── Special: edit → write_file ───────────────────────────
+        // ── Special: ls → search_files (set target=files + pattern) ──
+        if (normalizedCursor === "ls" && found.function.name === "search_files") {
+          mappedArgs.target = "files";
+          // search_files requires pattern; ls doesn't have one → use wildcard
+          if (!mappedArgs.pattern) mappedArgs.pattern = "*";
+        }
+
+        // ── Special: edit matched write_file → use content directly ──
         if (normalizedCursor === "edit" && found.function.name === "write_file") {
           return makeToolCall(callId, found.function.name, {
             path: cursorArgs.path,
             content: cursorArgs.streamContent ?? cursorArgs.fileText ?? "",
+          });
+        }
+
+        // ── Special: edit matched patch → rewrite as write_file ───
+        // Cursor edit only has full-file streamContent, cannot produce diff
+        if (normalizedCursor === "edit" && found.function.name === "patch") {
+          // Try to fall back to write_file instead
+          const writeFileTool = callerTools.find(
+            (t) => t.function.name.toLowerCase() === "write_file"
+          );
+          if (writeFileTool) {
+            return makeToolCall(callId, writeFileTool.function.name, {
+              path: cursorArgs.path,
+              content: cursorArgs.streamContent ?? cursorArgs.fileText ?? "",
+            });
+          }
+          // No write_file available — best-effort: patch with old_string=""
+          // WARNING: old_string="" with fuzzy matching is unreliable.
+          // The caller should prefer registering write_file for edit support.
+          return makeToolCall(callId, found.function.name, {
+            mode: "replace",
+            path: cursorArgs.path,
+            old_string: "",
+            new_string: (cursorArgs.streamContent as string) ?? "",
           });
         }
 
@@ -315,7 +348,9 @@ function transformArgs(
   const dropped = new Set(dropArgs);
   for (const [key, value] of Object.entries(raw)) {
     if (dropped.has(key)) continue;
-    const targetKey = argMap[key] ?? key;
+    // Only apply argMap mapping if the key is explicitly listed;
+    // otherwise pass through with original key name
+    const targetKey = key in argMap ? argMap[key] : key;
     if (value !== undefined && value !== null) {
       result[targetKey] = value;
     }
