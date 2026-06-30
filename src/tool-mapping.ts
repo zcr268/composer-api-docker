@@ -236,14 +236,15 @@ export function mapToolCall(
   const normalizedCursor = cursorToolName.toLowerCase();
 
   // 1) Exact name match with caller tools
+  // Note: only apply dropArgs (strip internals), NOT argMap — the caller
+  // intentionally used the Cursor tool name and expects Cursor-native param names.
   const exactMatch = callerTools.find(
     (t) => t.function.name.toLowerCase() === normalizedCursor
   );
   if (exactMatch) {
-    // Still apply dropArgs from the mapping table if available, to strip internal fields
     const mapping = TOOL_MAPPINGS.find((m) => m.cursorName === normalizedCursor);
     const cleanedArgs = mapping
-      ? transformArgs(cursorArgs, mapping.argMap, mapping.dropArgs)
+      ? transformArgs(cursorArgs, {}, mapping.dropArgs) // empty argMap: only drop, don't rename
       : cursorArgs;
     return makeToolCall(callId, exactMatch.function.name, cleanedArgs);
   }
@@ -270,6 +271,8 @@ export function mapToolCall(
         // ── Special: glob → search_files (set target=files) ──────
         if (normalizedCursor === "glob" && found.function.name === "search_files") {
           mappedArgs.target = "files";
+          // search_files requires pattern; if globPattern was not provided, use wildcard
+          if (!mappedArgs.pattern) mappedArgs.pattern = "*";
         }
 
         // ── Special: grep → search_files (set target=content) ────
@@ -320,7 +323,7 @@ export function mapToolCall(
             mode: "replace",
             path: cursorArgs.path,
             old_string: "",
-            new_string: (cursorArgs.streamContent as string) ?? "",
+            new_string: (cursorArgs.streamContent ?? cursorArgs.fileText) as string ?? "",
           });
         }
 
