@@ -3,7 +3,6 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "./config.js";
 import { createSession, runTurn } from "./agent-session.js";
-import { mapToolCall } from "./tool-mapping.js";
 import type {
   ChatCompletionRequest,
   ChatCompletionResponse,
