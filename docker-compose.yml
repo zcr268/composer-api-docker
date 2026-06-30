@@ -1,0 +1,21 @@
+services:
+  cursor-openai-bridge:
+    build:
+      context: .
+    image: cursor-openai-bridge:latest
+    container_name: cursor-openai-bridge
+    restart: unless-stopped
+    ports:
+      - "8791:8791"
+    environment:
+      - CURSOR_API_KEY=${CURSOR_API_KEY:-}
+      - BRIDGE_AUTH_TOKEN=${BRIDGE_AUTH_TOKEN:-}
+      - BRIDGE_PORT=8791
+      - BRIDGE_DEFAULT_MODEL=${BRIDGE_DEFAULT_MODEL:-composer-2.5}
+      - BRIDGE_WORKSPACE=/workspace
+    volumes:
+      - bridge-state:/root/.cursor-agent
+      - ./workspace:/workspace
+
+volumes:
+  bridge-state:

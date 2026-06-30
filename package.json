@@ -1,0 +1,19 @@
+{
+  "name": "cursor-openai-bridge",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible adapter for Cursor SDK — translates SDK tool calls into standard chat.completions tool_calls",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc --watch & node --watch dist/server.js"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
